@@ -33,6 +33,9 @@ let currentPrizePool = 0;
 // Add highest payout tracking
 let highestPayout = 0;
 
+// Add state tracking for player count
+let lastPlayerCount = 0;
+
 // Initialize OpenAI and Telegram Bot
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -174,10 +177,6 @@ async function getRecentPlayers() {
                     commitment: 'confirmed'
                 });
 
-                // Cache the signature regardless of transaction type
-                addToSignatureCache(sig.signature);
-
-                // Only process valid incoming payments
                 if (tx?.meta?.preBalances && tx?.meta?.postBalances) {
                     const transferAmount = (tx.meta.preBalances[0] - tx.meta.postBalances[0]) / 1000000000;
                     console.log('Transfer amount:', transferAmount);
@@ -205,8 +204,6 @@ async function getRecentPlayers() {
                     continue;
                 }
                 console.error('Error processing transaction:', error);
-                // Still cache signature even if there was an error processing it
-                addToSignatureCache(sig.signature);
             }
         }
         
@@ -460,26 +457,51 @@ async function startNewGame() {
         cleanupState();
         
         const players = await getRecentPlayers();
-        
-        if (players.length < 2) {
-            console.log(`Not enough players (${players.length}/2), checking again in 1 minute...`);
+        const currentPlayerCount = players.length;
+
+        if (currentPlayerCount < 2) {
+            console.log(`Not enough players (${currentPlayerCount}/2), checking again in 1 minute...`);
             
-            const now = Date.now();
-            if (!lastNoPlayersMessage || (now - lastNoPlayersMessage) > 5 * 60 * 1000) {
+            // Notify when first player joins (count changes from 0 to 1)
+            if (lastPlayerCount === 0 && currentPlayerCount === 1) {
                 await bot.sendMessage(GROUP_CHAT_ID, 
-                    `🎮 Welcome to Mindful 8080!\n\n` +
-                    `Waiting for more players... (${players.length}/2)\n\n` +
+                    `🎮 First player has joined!\n\n` +
+                    `Waiting for one more player... (1/2)\n\n` +
                     `To play, send 0.01 SOL to:\n` +
                     `\`${SYSTEM_WALLET}\`\n\n` +
                     `🏆 Highest Payout: ${highestPayout.toFixed(3)} SOL\n` +
                     `Winner takes 50% of the prize pool! 💰`,
                     { parse_mode: 'Markdown' }
                 );
-                lastNoPlayersMessage = now;
             }
+            
+            // Update last player count
+            lastPlayerCount = currentPlayerCount;
             
             global.timeoutCheckPlayers = setTimeout(startNewGame, 60 * 1000);
             return;
+        }
+
+        // Reset player count when game starts
+        lastPlayerCount = 0;
+
+        // Only now cache the signatures for these players
+        const signatures = await connection.getSignaturesForAddress(
+            new PublicKey(SYSTEM_WALLET),
+            { limit: 10 }
+        );
+        
+        for (const sig of signatures) {
+            const tx = await connection.getParsedTransaction(sig.signature);
+            if (tx?.transaction?.message?.accountKeys) {
+                const sender = tx.transaction.message.accountKeys.find(
+                    key => key.pubkey.toString() !== SYSTEM_WALLET
+                )?.pubkey.toString();
+                
+                if (players.includes(sender)) {
+                    addToSignatureCache(sig.signature);
+                }
+            }
         }
 
         currentPrizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
