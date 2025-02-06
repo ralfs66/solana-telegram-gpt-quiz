@@ -30,6 +30,9 @@ const MAX_CSV_LINES = 1000;
 // Add game state variables
 let currentPrizePool = 0;
 
+// Add highest payout tracking
+let highestPayout = 0;
+
 // Initialize OpenAI and Telegram Bot
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -247,50 +250,63 @@ function cleanupState() {
     }
 }
 
-// Update sendSolanaWithRetry to be more patient and quiet about retries
-async function sendSolanaWithRetry(walletAddress, amount, retryCount = 0) {
+// Update sendSolanaWithRetry function
+async function sendSolanaWithRetry(walletAddress, amount, retryCount = 0, existingSignature = null) {
     try {
-        console.log(`Attempting to send ${amount} SOL to ${walletAddress} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-        
-        const paymentResult = await sendSolana(walletAddress, amount);
-        
-        // If we got a signature, let's be patient and check its status
-        if (paymentResult.signature) {
-            // Try confirming the transaction multiple times
-            for (let i = 0; i < 6; i++) { // Check for 30 seconds (5s * 6)
-                try {
-                    await sleep(5000); // Wait 5 seconds between checks
-                    const status = await connection.getSignatureStatus(paymentResult.signature);
-                    console.log(`Check ${i + 1}: Transaction status:`, status?.value?.confirmationStatus);
-                    
-                    if (status?.value?.confirmationStatus === 'confirmed' || 
-                        status?.value?.confirmationStatus === 'finalized') {
-                        return {
-                            success: true,
-                            signature: paymentResult.signature
-                        };
-                    }
-                } catch (error) {
-                    console.error('Error checking transaction status:', error);
+        // If we have an existing signature, check its status first
+        if (existingSignature) {
+            try {
+                const status = await connection.getSignatureStatus(existingSignature);
+                
+                // If transaction is confirmed or finalized, it's successful
+                if (status?.value?.confirmationStatus === 'confirmed' || 
+                    status?.value?.confirmationStatus === 'finalized') {
+                    console.log('Previous transaction confirmed:', existingSignature);
+                    return {
+                        success: true,
+                        signature: existingSignature
+                    };
                 }
+                
+                // If transaction failed (not timeout), stop retrying
+                if (status?.value?.err) {
+                    console.log('Previous transaction failed:', status.value.err);
+                    return {
+                        success: false,
+                        error: 'Transaction failed'
+                    };
+                }
+            } catch (error) {
+                console.error('Error checking transaction status:', error);
             }
         }
 
-        // If we haven't reached max retries, try again silently
-        if (retryCount < MAX_RETRIES - 1) {
-            console.log(`Payment pending, retrying silently...`);
-            await sleep(RETRY_DELAY);
-            return sendSolanaWithRetry(walletAddress, amount, retryCount + 1);
+        // Only send new transaction if we don't have an existing one
+        if (!existingSignature) {
+            console.log(`Attempting to send ${amount} SOL to ${walletAddress} (attempt ${retryCount + 1}/5)`);
+            const paymentResult = await sendSolana(walletAddress, amount);
+            existingSignature = paymentResult.signature;
         }
 
-        return paymentResult;
+        // If we haven't reached max retries, wait and check again
+        if (retryCount < 4) {
+            console.log('Payment pending, checking status in 10 seconds...');
+            await sleep(10000);
+            return sendSolanaWithRetry(walletAddress, amount, retryCount + 1, existingSignature);
+        }
+
+        return {
+            success: false,
+            error: 'Transaction confirmation timeout'
+        };
     } catch (error) {
         console.error(`Error in retry attempt ${retryCount + 1}:`, error);
         
-        // If we haven't reached max retries, try again silently
-        if (retryCount < MAX_RETRIES - 1) {
-            await sleep(RETRY_DELAY);
-            return sendSolanaWithRetry(walletAddress, amount, retryCount + 1);
+        // Only retry if it's a timeout error
+        if (error.message.includes('timeout') && retryCount < 4) {
+            console.log('Payment pending, checking status in 5 seconds...');
+            await sleep(5000);
+            return sendSolanaWithRetry(walletAddress, amount, retryCount + 1, existingSignature);
         }
 
         return {
@@ -317,18 +333,22 @@ bot.on('message', async (msg) => {
                 await bot.sendMessage(GROUP_CHAT_ID,
                     `💳 Processing payment...\n\n` +
                     `🏆 Winner: @${username}\n` +
-                    `💰 Amount: ${winnerPrize.toFixed(3)} SOL (50% of ${currentPrizePool.toFixed(3)})\n` +
                     `📍 To: \`${walletAddress}\`\n\n` +
-                    `⏳ Please wait for confirmation...`,
                     { parse_mode: 'Markdown' }
                 );
 
                 try {
                     const paymentResult = await sendSolanaWithRetry(walletAddress, winnerPrize);
                     if (paymentResult.success) {
+                        const currentPayout = winnerPrize;
+                        if (currentPayout > highestPayout) {
+                            highestPayout = currentPayout;
+                        }
+                        
                         await bot.sendMessage(GROUP_CHAT_ID,
                             `🎊 Congratulations @${username}!\n\n` +
                             `${winnerPrize.toFixed(3)} SOL has been sent to your wallet!\n` +
+                            `${currentPayout > highestPayout ? '🎉 New Highest Payout! 🎉\n' : ''}` +
                             `Transaction: ${formatTransaction(paymentResult.signature)}\n\n` +
                             `New game starting in 1 minute...`,
                             { parse_mode: 'Markdown' }
@@ -338,15 +358,13 @@ bot.on('message', async (msg) => {
                         setTimeout(startNewGame, 60000);
                     } else {
                         await bot.sendMessage(GROUP_CHAT_ID,
-                            `⚠️ There seems to be a delay with the payment.\n` +
-                            `Please check your wallet in a few minutes or contact an administrator if needed.`
+                            `⚠️ There seems to be a delay with the payment.\n`
                         );
                     }
                 } catch (error) {
                     console.error('Payment error:', error);
                     await bot.sendMessage(GROUP_CHAT_ID, 
-                        `⚠️ There seems to be a delay with the payment.\n` +
-                        `Please check your wallet in a few minutes or contact an administrator if needed.`
+                        `⚠️ There seems to be a delay with the payment.\n` 
                     );
                 }
             } else {
@@ -443,30 +461,27 @@ async function startNewGame() {
         
         const players = await getRecentPlayers();
         
-        if (players.length === 0) {
-            console.log('No players found, checking again in 1 minute...');
+        if (players.length < 2) {
+            console.log(`Not enough players (${players.length}/2), checking again in 1 minute...`);
             
-            // Only send message if it's been more than 5 minutes since last one
             const now = Date.now();
             if (!lastNoPlayersMessage || (now - lastNoPlayersMessage) > 5 * 60 * 1000) {
                 await bot.sendMessage(GROUP_CHAT_ID, 
                     `🎮 Welcome to Mindful 8080!\n\n` +
+                    `Waiting for more players... (${players.length}/2)\n\n` +
                     `To play, send 0.01 SOL to:\n` +
                     `\`${SYSTEM_WALLET}\`\n\n` +
+                    `🏆 Highest Payout: ${highestPayout.toFixed(3)} SOL\n` +
                     `Winner takes 50% of the prize pool! 💰`,
                     { parse_mode: 'Markdown' }
                 );
                 lastNoPlayersMessage = now;
             }
             
-            global.timeoutCheckPlayers = setTimeout(startNewGame, 60 * 1000); // 1 minute
+            global.timeoutCheckPlayers = setTimeout(startNewGame, 60 * 1000);
             return;
         }
 
-        // Reset last message timestamp when game starts
-        lastNoPlayersMessage = null;
-
-        // Store current prize pool for this round
         currentPrizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
         currentPlayers = players;
 
@@ -475,8 +490,9 @@ async function startNewGame() {
             `Think fast, answer smart, and claim your share of the prize pool! 💰\n\n` +
             `To participate: Send exactly 0.01 SOL to:\n` +
             `\`${SYSTEM_WALLET}\`\n\n` +
-            `💸 Prize Pool So Far: ${currentPrizePool.toFixed(3)} SOL\n` +
-            `🎯 Current Players:\n${players.map(p => `• ${formatSolanaAddress(p)}`).join('\n')}\n\n` +
+            `💸 Current Prize: ${(currentPrizePool/2).toFixed(3)} SOL\n` +
+            `🏆 Highest Payout: ${highestPayout.toFixed(3)} SOL\n` +
+            `🎯 Current Players (${players.length}):\n${players.map(p => `• ${formatSolanaAddress(p)}`).join('\n')}\n\n` +
             `⏳ Game begins in 1 minute... Brace yourselves!`,
             { parse_mode: 'Markdown' }
         );
@@ -487,11 +503,8 @@ async function startNewGame() {
             currentQuizMessages = [];
             
             await bot.sendMessage(GROUP_CHAT_ID,
-                `❓ Question Time!\n\n` +
                 `${question}\n\n` +
-                `⏱️ You have 10 minutes to submit your best answer!\n` +
-                `🏆 Winner takes 50% of the prize pool!\n` +
-                `🎯 Good luck, players!`
+                `⏱️ You have 10 minutes to submit your best answer!`
             );
 
             global.timeoutEvaluate = setTimeout(evaluateAndReward, QUIZ_INTERVAL);
@@ -519,8 +532,7 @@ async function evaluateAndReward() {
             await bot.sendMessage(GROUP_CHAT_ID,
                 `⏳ No answers yet! The question remains open:\n\n` +
                 `❓ ${currentQuestion}\n\n` +
-                `💰 Prize Pool: ${(await connection.getBalance(new PublicKey(getBotPublicKey())) / 2000000000).toFixed(3)} SOL\n` +
-                `🎯 Be the first to answer correctly and win 50%!\n\n` +
+                `🎯 Be the first to answer correctly and win SOL!\n\n` +
                 `⏱️ Clock is ticking...`,
                 { parse_mode: 'Markdown' }
             );
@@ -582,7 +594,6 @@ Do not include any other text or explanation.`
                 await bot.sendMessage(GROUP_CHAT_ID,
                     `🎉 Game Over!\n\n` +
                     `👑 Winner: @${winnerUsername}\n` +
-                    `💰 Prize: ${winnerPrize.toFixed(3)} SOL (50% of pool)\n\n` +
                     `📚 ${explanation}\n\n` +
                     `@${winnerUsername}, reply with your Solana wallet address to claim your prize!\n` +
                     `⏳ You have 5 minutes to claim.`,
@@ -594,7 +605,7 @@ Do not include any other text or explanation.`
                     if (global.currentWinner === winnerUsername) {
                         global.currentWinner = null;
                         bot.sendMessage(GROUP_CHAT_ID, 
-                            `⚠️ Time's up! Prize not claimed.\n` +
+                            `⚠️ Time's up!\n` +
                             `Starting fresh game with new players...`
                         );
                         startNewGame();
