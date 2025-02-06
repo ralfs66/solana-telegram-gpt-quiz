@@ -27,6 +27,9 @@ const RETRY_DELAY = 5000; // 5 seconds
 const SIGNATURES_FILE = 'used_signatures.csv';
 const MAX_CSV_LINES = 1000;
 
+// Add game state variables
+let currentPrizePool = 0;
+
 // Initialize OpenAI and Telegram Bot
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -319,14 +322,13 @@ bot.on('message', async (msg) => {
                     return;
                 }
 
-                const prizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
-                const winnerPrize = prizePool * 0.5;
+                const winnerPrize = currentPrizePool / 2; // Exactly 50% of stored prize pool
 
                 // Send processing message
                 const processingMsg = await bot.sendMessage(GROUP_CHAT_ID,
                     `💳 Processing payment...\n\n` +
                     `🏆 Winner: @${username}\n` +
-                    `💰 Amount: ${winnerPrize.toFixed(3)} SOL\n` +
+                    `💰 Amount: ${winnerPrize.toFixed(3)} SOL (50% of ${currentPrizePool.toFixed(3)})\n` +
                     `📍 To: \`${walletAddress}\`\n\n` +
                     `⏳ Please wait for confirmation...`,
                     { parse_mode: 'Markdown' }
@@ -463,7 +465,8 @@ async function startNewGame() {
             const now = Date.now();
             if (!lastNoPlayersMessage || (now - lastNoPlayersMessage) > 5 * 60 * 1000) {
                 await bot.sendMessage(GROUP_CHAT_ID, 
-                    `🎮 To play, send 0.01 SOL to:\n` +
+                    `🎮 Welcome to Mindful 8080!\n\n` +
+                    `To play, send 0.01 SOL to:\n` +
                     `\`${SYSTEM_WALLET}\`\n\n` +
                     `Winner takes 50% of the prize pool! 💰`,
                     { parse_mode: 'Markdown' }
@@ -478,15 +481,16 @@ async function startNewGame() {
         // Reset last message timestamp when game starts
         lastNoPlayersMessage = null;
 
+        // Store current prize pool for this round
+        currentPrizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
         currentPlayers = players;
-        const prizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
 
         await bot.sendMessage(GROUP_CHAT_ID, 
-            `🎮 Welcome to the Ultimate Solana Quiz Challenge!\n` +
+            `🎮 Welcome to Mindful 8080!\n` +
             `Think fast, answer smart, and claim your share of the prize pool! 💰\n\n` +
             `To participate: Send exactly 0.01 SOL to:\n` +
             `\`${SYSTEM_WALLET}\`\n\n` +
-            `💸 Prize Pool So Far: ${prizePool.toFixed(3)} SOL\n` +
+            `💸 Prize Pool So Far: ${currentPrizePool.toFixed(3)} SOL\n` +
             `🎯 Current Players:\n${players.map(p => `• ${formatSolanaAddress(p)}`).join('\n')}\n\n` +
             `⏳ Game begins in 1 minute... Brace yourselves!`,
             { parse_mode: 'Markdown' }
@@ -582,8 +586,7 @@ Do not include any other text or explanation.`
             if (winnerMatch) {
                 const winnerUsername = winnerMatch[1];
                 global.currentWinner = winnerUsername;
-                const prizePool = await connection.getBalance(new PublicKey(getBotPublicKey())) / 1000000000;
-                const winnerPrize = prizePool * 0.5;
+                const winnerPrize = currentPrizePool / 2; // Exactly 50% of stored prize pool
 
                 // Get winner's answer for explanation
                 const winnerAnswer = currentQuizMessages.find(m => m.username === winnerUsername)?.text || '';
