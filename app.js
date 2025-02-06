@@ -312,20 +312,9 @@ bot.on('message', async (msg) => {
             const walletMatch = text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/);
             if (walletMatch) {
                 const walletAddress = walletMatch[0];
-                
-                if (!currentPlayers.includes(walletAddress)) {
-                    await bot.sendMessage(GROUP_CHAT_ID,
-                        `❌ @${username}, this wallet address hasn't participated in the game.\n` +
-                        `Please provide one of these addresses:\n${currentPlayers.map(p => `• ${formatSolanaAddress(p)}`).join('\n')}`,
-                        { parse_mode: 'Markdown' }
-                    );
-                    return;
-                }
+                const winnerPrize = currentPrizePool / 2; // 50% of stored prize pool
 
-                const winnerPrize = currentPrizePool / 2; // Exactly 50% of stored prize pool
-
-                // Send processing message
-                const processingMsg = await bot.sendMessage(GROUP_CHAT_ID,
+                await bot.sendMessage(GROUP_CHAT_ID,
                     `💳 Processing payment...\n\n` +
                     `🏆 Winner: @${username}\n` +
                     `💰 Amount: ${winnerPrize.toFixed(3)} SOL (50% of ${currentPrizePool.toFixed(3)})\n` +
@@ -337,21 +326,17 @@ bot.on('message', async (msg) => {
                 try {
                     const paymentResult = await sendSolanaWithRetry(walletAddress, winnerPrize);
                     if (paymentResult.success) {
-                        // Delete processing message
-                        await bot.deleteMessage(GROUP_CHAT_ID, processingMsg.message_id)
-                            .catch(err => console.error('Error deleting processing message:', err));
-
                         await bot.sendMessage(GROUP_CHAT_ID,
                             `🎊 Congratulations @${username}!\n\n` +
-                            `${winnerPrize.toFixed(3)} SOL (50% of pool) has been sent to your wallet!\n` +
+                            `${winnerPrize.toFixed(3)} SOL has been sent to your wallet!\n` +
                             `Transaction: ${formatTransaction(paymentResult.signature)}\n\n` +
                             `New game starting in 1 minute...`,
                             { parse_mode: 'Markdown' }
                         );
+                        // Clear winner ONLY after successful payment
                         global.currentWinner = null;
                         setTimeout(startNewGame, 60000);
                     } else {
-                        // Only show error after all retries and confirmation attempts have failed
                         await bot.sendMessage(GROUP_CHAT_ID,
                             `⚠️ There seems to be a delay with the payment.\n` +
                             `Please check your wallet in a few minutes or contact an administrator if needed.`
